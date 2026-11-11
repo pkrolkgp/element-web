@@ -1,0 +1,104 @@
+# Build only the patched fork branch; never fetch a prebuilt upstream webapp.
+name: Element thread CPU test - macOS ARM64
+
+on:
+    push:
+        branches:
+            - fix/35728-thread-idle-render-churn
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: element-thread-cpu-macos-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    build-macos-arm64:
+        name: Test and build macOS Apple Silicon
+        runs-on: macos-26
+        timeout-minutes: 120
+        env:
+            NX_DEFAULT_OUTPUT_STYLE: stream-without-prefixes
+            CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        steps:
+            - name: Checkout patched fork code
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+
+            - name: Set up Node and pnpm
+              uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+              with:
+                  node-version-file: apps/desktop/.node-version
+                  cache: true
+                  install: false
+
+            - name: Install source dependencies (including matrix-js-sdk)
+              run: ./scripts/layered.sh
+
+            - name: Prepare unit-test dependencies
+              run: pnpm exec nx run-many -t test:unit:prepare -p
+
+            - name: Run targeted thread regression tests
+              run: |
+                  pnpm exec vitest run \
+                      apps/web/src/components/structures/ThreadView.test.tsx \
+                      apps/web/src/components/structures/TimelinePanel.test.tsx
+
+            - name: Build Element Web from this branch
+              run: |
+                  cp apps/web/element.io/develop/config.json apps/web/config.json
+                  pnpm -C apps/web run build
+                  test -f apps/web/webapp/index.html
+
+            - name: Pack isolated test application
+              run: |
+                  mkdir -p apps/desktop/webapp
+                  cp -R apps/web/webapp/. apps/desktop/webapp/
+                  python3 - <<'PY'
+                  import json
+                  from pathlib import Path
+
+                  config_path = Path("apps/desktop/webapp/config.json")
+                  config = json.loads(config_path.read_text())
+                  # Prevent an unsigned local test app using the official update channel.
+                  config.pop("update_base_url", None)
+                  config.pop("sentry", None)
+                  config.pop("posthog", None)
+                  config["brand"] = "Element Thread CPU Test"
+                  config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+                  variant = {
+                      "appId": "pl.pkrolkgp.element.thread-cpu-test",
+                      "name": "element-thread-cpu-test",
+                      "productName": "Element Thread CPU Test",
+                      "description": "Isolated macOS test build of Element thread CPU mitigation",
+                      "protocols": ["pl.pkrolkgp.element.thread-cpu-test"],
+                  }
+                  Path("apps/desktop/variant.json").write_text(json.dumps(variant, indent=2) + "\n")
+                  PY
+                  pnpm -C apps/desktop run asar-webapp
+                  test -s apps/desktop/webapp.asar
+
+            - name: Build unsigned Apple Silicon DMG
+              working-directory: apps/desktop
+              env:
+                  VARIANT_PATH: variant.json
+              run: pnpm run build --arm64 --publish never -m dmg
+
+            - name: Verify output
+              run: |
+                  ls -lh apps/desktop/dist/*.dmg
+                  test -n "$(find apps/desktop/dist -maxdepth 1 -name '*.dmg' -print -quit)"
+                  echo "Built patched commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+                  echo "This is an unsigned, unnotarized testing build. Do not replace the standard Element app." >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Upload test DMG
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+              with:
+                  name: Element-Thread-CPU-Test-macOS-arm64
+                  path: apps/desktop/dist/*.dmg
+                  if-no-files-found: error
+                  retention-days: 7
